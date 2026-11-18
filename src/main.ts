@@ -11,6 +11,19 @@ const enum Space {
   Plane = 0,
   Torus = 1,
   Klein = 2,
+  Pillowcase = 3,
+}
+
+// How the generator `a` acts on the strip it crosses into (see the shader).
+function flip(space: Space): [number, number] {
+  switch (space) {
+    case Space.Klein:
+      return [1, -1];
+    case Space.Pillowcase:
+      return [-1, -1];
+    default:
+      return [1, 1];
+  }
 }
 
 const enum Camera {
@@ -47,10 +60,13 @@ function reduceShip(ship: Iso) {
   let [x, y] = ship.t;
   const n = Math.floor((x + L) / (2 * L));
   x -= 2 * L * n;
-  if (state.space === Space.Klein && Math.abs(n) % 2 === 1) {
-    // Glide reflection: compose with diag(1, -1).
-    y = -y;
-    ship.m = [m00, -m10, m01, -m11];
+  if (Math.abs(n) % 2 === 1) {
+    // Compose with diag(f): a reflection on the Klein bottle, a half-turn
+    // on the pillowcase.
+    const [fx, fy] = flip(state.space);
+    x *= fx;
+    y *= fy;
+    ship.m = [fx * m00, fy * m10, fx * m01, fy * m11];
   }
   y -= 2 * L * Math.floor((y + L) / (2 * L));
   ship.t = [x, y];
