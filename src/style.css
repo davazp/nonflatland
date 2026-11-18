@@ -1,0 +1,61 @@
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #05060a;
+  color: #d8dcef;
+  font: 13px/1.4 ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+canvas {
+  display: block;
+  width: 100vw;
+  height: 100vh;
+}
+
+#hud {
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  background: rgba(10, 12, 22, 0.75);
+  border: 1px solid rgba(140, 150, 200, 0.25);
+  border-radius: 6px;
+}
+
+#hud label {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: center;
+}
+
+#hud select {
+  font: inherit;
+  color: inherit;
+  background: #141828;
+  border: 1px solid rgba(140, 150, 200, 0.35);
+  border-radius: 4px;
+  padding: 2px 4px;
+}
+
+#hud .help {
+  opacity: 0.6;
+  font-size: 11px;
+}
+
+#error {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: 16px;
+}
+
+#error[hidden] {
+  display: none;
+}

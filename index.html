@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Nonflatland</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <canvas id="canvas"></canvas>
+    <div id="hud">
+      <label>
+        Space
+        <select id="space">
+          <option value="0">Plane</option>
+          <option value="1" selected>Torus</option>
+          <option value="2">Klein bottle</option>
+        </select>
+      </label>
+      <label>
+        Camera
+        <select id="camera">
+          <option value="0">Fixed</option>
+          <option value="1">Ship</option>
+        </select>
+      </label>
+      <div class="help">
+        ←/→ or A/D rotate · ↑/W thrust · ↓/S reverse<br />
+        C toggle camera · R reset · wheel zoom
+      </div>
+    </div>
+    <div id="error" hidden></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
