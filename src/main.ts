@@ -1,75 +1,29 @@
 import shaderCode from "./shader.wgsl?raw";
 
-// Half side of the fundamental domain D = [-L, L)².
-const L = 1;
-const SHIP_SIZE = 0.07;
+// All geometry lives in the shader: the metric, geodesics, chart
+// transitions and the ship's motion (see shader.wgsl). This file only
+// handles input and drives the GPU.
+
 const TURN_SPEED = 2.6; // rad/s
-const MAX_SPEED = 0.9; // world units/s
-const ACCEL = 2.5;
-
-const enum Space {
-  Plane = 0,
-  Torus = 1,
-  Klein = 2,
-  Pillowcase = 3,
-}
-
-// How the generator `a` acts on the strip it crosses into (see the shader).
-function flip(space: Space): [number, number] {
-  switch (space) {
-    case Space.Klein:
-      return [1, -1];
-    case Space.Pillowcase:
-      return [-1, -1];
-    default:
-      return [1, 1];
-  }
-}
+const ACCEL = 2.8; // normalized speed units/s
 
 const enum Camera {
   Fixed = 0,
   Ship = 1,
 }
 
-// The ship is an isometry of the plane, p ↦ M p + t, mapping its local frame
-// (nose along +y) to the world. M is column-major: [m00, m10, m01, m11].
-// It can be orientation-reversing after crossing the Klein bottle's seam.
-interface Iso {
-  m: [number, number, number, number];
-  t: [number, number];
-}
-
 const state = {
-  space: Space.Torus as Space,
+  space: 1,
   camera: Camera.Fixed as Camera,
   zoom: 1,
-  speed: 0,
-  ship: { m: [1, 0, 0, 1], t: [0, -0.3] } as Iso,
+  speed: 0, // -0.5 .. 1
+  showCurvature: true,
+  reset: true,
 };
 
 function resetShip() {
-  state.ship = { m: [1, 0, 0, 1], t: [0, -0.3] };
+  state.reset = true;
   state.speed = 0;
-}
-
-// Bring the ship back into D by composing with a deck transformation.
-// Mirrors `reduce` in the shader.
-function reduceShip(ship: Iso) {
-  if (state.space === Space.Plane) return;
-  const [m00, m10, m01, m11] = ship.m;
-  let [x, y] = ship.t;
-  const n = Math.floor((x + L) / (2 * L));
-  x -= 2 * L * n;
-  if (Math.abs(n) % 2 === 1) {
-    // Compose with diag(f): a reflection on the Klein bottle, a half-turn
-    // on the pillowcase.
-    const [fx, fy] = flip(state.space);
-    x *= fx;
-    y *= fy;
-    ship.m = [fx * m00, fy * m10, fx * m01, fy * m11];
-  }
-  y -= 2 * L * Math.floor((y + L) / (2 * L));
-  ship.t = [x, y];
 }
 
 // ---------------------------------------------------------------------------
@@ -84,7 +38,8 @@ spaceSelect.value = String(state.space);
 cameraSelect.value = String(state.camera);
 
 spaceSelect.addEventListener("change", () => {
-  state.space = Number(spaceSelect.value) as Space;
+  state.space = Number(spaceSelect.value);
+  state.zoom = 1;
   resetShip();
   spaceSelect.blur();
 });
@@ -109,6 +64,8 @@ window.addEventListener(
       cameraSelect.value = String(state.camera);
     } else if (e.code === "KeyR") {
       resetShip();
+    } else if (e.code === "KeyK") {
+      state.showCurvature = !state.showCurvature;
     }
   },
   { capture: true },
@@ -124,31 +81,18 @@ window.addEventListener(
   { passive: true },
 );
 
-function update(dt: number) {
-  const ship = state.ship;
+// Returns the turn angle for this frame and updates the speed.
+function readControls(dt: number): number {
   const left = keys.has("ArrowLeft") || keys.has("KeyA");
   const right = keys.has("ArrowRight") || keys.has("KeyD");
   const up = keys.has("ArrowUp") || keys.has("KeyW");
   const down = keys.has("ArrowDown") || keys.has("KeyS");
 
-  // Rotate in the ship's own frame: M ← M R(θ). On a mirrored ship this turns
-  // the "wrong" way when seen from outside, as it should.
-  const theta = ((left ? 1 : 0) - (right ? 1 : 0)) * TURN_SPEED * dt;
-  if (theta !== 0) {
-    const c = Math.cos(theta);
-    const s = Math.sin(theta);
-    const [m00, m10, m01, m11] = ship.m;
-    ship.m = [m00 * c + m01 * s, m10 * c + m11 * s, -m00 * s + m01 * c, -m10 * s + m11 * c];
-  }
-
-  const target = up ? MAX_SPEED : down ? -0.5 * MAX_SPEED : 0;
+  const target = up ? 1 : down ? -0.5 : 0;
   const dv = target - state.speed;
   state.speed += Math.sign(dv) * Math.min(Math.abs(dv), ACCEL * dt);
 
-  // Forward is M (0, 1).
-  ship.t[0] += ship.m[2] * state.speed * dt;
-  ship.t[1] += ship.m[3] * state.speed * dt;
-  reduceShip(ship);
+  return ((left ? 1 : 0) - (right ? 1 : 0)) * TURN_SPEED * dt;
 }
 
 // ---------------------------------------------------------------------------
@@ -183,45 +127,61 @@ async function main() {
     console[m.type === "error" ? "error" : "warn"](`WGSL ${m.lineNum}:${m.linePos} ${m.message}`);
   }
 
-  const bindGroupLayout = device.createBindGroupLayout({
-    entries: [
-      {
-        binding: 0,
-        visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
-        buffer: { type: "uniform" },
-      },
-    ],
-  });
-
-  const pipeline = device.createRenderPipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
-    vertex: { module, entryPoint: "vs" },
-    fragment: { module, entryPoint: "fs", targets: [{ format }] },
-    primitive: { topology: "triangle-list" },
-  });
-
-  // Layout matches `Uniforms` in the shader (128 bytes).
-  const uniformData = new ArrayBuffer(128);
+  // Layout matches `Uniforms` in the shader (48 bytes).
+  const uniformData = new ArrayBuffer(48);
   const f32 = new Float32Array(uniformData);
   const u32 = new Uint32Array(uniformData);
   const uniformBuffer = device.createBuffer({
     size: uniformData.byteLength,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
-  const bindGroup = device.createBindGroup({
-    layout: bindGroupLayout,
-    entries: [{ binding: 0, resource: { buffer: uniformBuffer } }],
+
+  // `Ship` in the shader: written by the compute pass, read when drawing.
+  const shipBuffer = device.createBuffer({ size: 32, usage: GPUBufferUsage.STORAGE });
+
+  const computeLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+    ],
+  });
+  const renderLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+      { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
+    ],
   });
 
-  // Write an affine map p ↦ M p + t as a mat3x3f (columns padded to vec4).
-  function writeMat(offset: number, m: number[], t: number[]) {
-    f32.set([m[0], m[1], 0, 0, m[2], m[3], 0, 0, t[0], t[1], 1, 0], offset);
-  }
+  const computePipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [computeLayout] }),
+    compute: { module, entryPoint: "updateShip" },
+  });
+  const renderPipeline = device.createRenderPipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [renderLayout] }),
+    vertex: { module, entryPoint: "vs" },
+    fragment: { module, entryPoint: "fs", targets: [{ format }] },
+    primitive: { topology: "triangle-list" },
+  });
 
+  const computeBindGroup = device.createBindGroup({
+    layout: computeLayout,
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuffer } },
+      { binding: 1, resource: { buffer: shipBuffer } },
+    ],
+  });
+  const renderBindGroup = device.createBindGroup({
+    layout: renderLayout,
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuffer } },
+      { binding: 2, resource: { buffer: shipBuffer } },
+    ],
+  });
+
+  // The ship camera traces a geodesic per pixel, so render at CSS resolution.
   function resize() {
-    const dpr = window.devicePixelRatio || 1;
-    const w = Math.max(1, Math.round(canvas.clientWidth * dpr));
-    const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
+    const w = Math.max(1, Math.round(canvas.clientWidth));
+    const h = Math.max(1, Math.round(canvas.clientHeight));
     if (canvas.width !== w || canvas.height !== h) {
       canvas.width = w;
       canvas.height = h;
@@ -232,35 +192,31 @@ async function main() {
   function frame(now: number) {
     const dt = Math.min(0.05, (now - last) / 1000);
     last = now;
-    update(dt);
+    const turn = readControls(dt);
     resize();
 
-    const { m, t } = state.ship;
-
-    // The only camera-dependent part: the screen → world map.
-    if (state.camera === Camera.Fixed) {
-      const z = 1.08 * L * state.zoom;
-      writeMat(0, [z, 0, 0, z], [0, 0]);
-    } else {
-      const z = 0.9 * L * state.zoom;
-      writeMat(0, m.map((v) => v * z), t);
-    }
-
-    // Inverse of the ship isometry: Mᵀ p - Mᵀ t.
-    const mt = [m[0], m[2], m[1], m[3]];
-    writeMat(12, mt, [-(mt[0] * t[0] + mt[2] * t[1]), -(mt[1] * t[0] + mt[3] * t[1])]);
-
-    f32[24] = canvas.width;
-    f32[25] = canvas.height;
-    f32[26] = L;
-    u32[27] = state.space;
-    f32[28] = now / 1000;
-    f32[29] = Math.max(0, state.speed / MAX_SPEED);
-    u32[30] = state.camera;
-    f32[31] = SHIP_SIZE;
+    f32[0] = canvas.width;
+    f32[1] = canvas.height;
+    f32[2] = now / 1000;
+    f32[3] = dt;
+    u32[4] = state.space;
+    u32[5] = state.camera;
+    f32[6] = state.zoom;
+    f32[7] = state.speed;
+    f32[8] = turn;
+    u32[9] = state.reset ? 1 : 0;
+    u32[10] = state.showCurvature ? 1 : 0;
     device.queue.writeBuffer(uniformBuffer, 0, uniformData);
+    state.reset = false;
 
     const encoder = device.createCommandEncoder();
+
+    const compute = encoder.beginComputePass();
+    compute.setPipeline(computePipeline);
+    compute.setBindGroup(0, computeBindGroup);
+    compute.dispatchWorkgroups(1);
+    compute.end();
+
     const pass = encoder.beginRenderPass({
       colorAttachments: [
         {
@@ -271,12 +227,12 @@ async function main() {
         },
       ],
     });
-    pass.setPipeline(pipeline);
-    pass.setBindGroup(0, bindGroup);
+    pass.setPipeline(renderPipeline);
+    pass.setBindGroup(0, renderBindGroup);
     pass.draw(3);
     pass.end();
-    device.queue.submit([encoder.finish()]);
 
+    device.queue.submit([encoder.finish()]);
     requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);
