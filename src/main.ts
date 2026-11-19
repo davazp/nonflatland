@@ -21,6 +21,11 @@ const state = {
   reset: true,
 };
 
+// `zoom` scales the visible region: larger values show more of the space.
+function zoomBy(factor: number) {
+  state.zoom = Math.min(6, Math.max(0.25, state.zoom * factor));
+}
+
 function resetShip() {
   state.reset = true;
   state.speed = 0;
@@ -58,6 +63,13 @@ window.addEventListener(
       (document.activeElement as HTMLElement | null)?.blur();
     }
     keys.add(e.code);
+    if (e.key === "+" || e.key === "=" || e.code === "NumpadAdd") {
+      zoomBy(1 / 1.2);
+      return;
+    } else if (e.key === "-" || e.key === "_" || e.code === "NumpadSubtract") {
+      zoomBy(1.2);
+      return;
+    }
     if (e.repeat) return;
     if (e.code === "KeyC") {
       state.camera = state.camera === Camera.Fixed ? Camera.Ship : Camera.Fixed;
@@ -76,7 +88,7 @@ window.addEventListener("blur", () => keys.clear());
 window.addEventListener(
   "wheel",
   (e) => {
-    state.zoom = Math.min(6, Math.max(0.25, state.zoom * Math.exp(e.deltaY * 0.001)));
+    zoomBy(Math.exp(e.deltaY * 0.001));
   },
   { passive: true },
 );
