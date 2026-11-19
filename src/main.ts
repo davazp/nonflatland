@@ -8,6 +8,13 @@ const TURN_SPEED = 2.6; // rad/s
 const ACCEL = 2.8; // normalized speed units/s
 const FIRE_INTERVAL = 0.15; // s between balls while Space is held
 
+// `Loop` in the shader: a 48-byte header, block bounding boxes, then points
+// and scratch space. Only the header is read back.
+const LOOP_MAX = 256;
+const LOOP_BLOCKS = LOOP_MAX / 16;
+const LOOP_HEADER_SIZE = 48;
+const LOOP_BUFFER_SIZE = LOOP_HEADER_SIZE + LOOP_BLOCKS * 16 + 2 * LOOP_MAX * 32;
+
 const enum Camera {
   Fixed = 0,
   Ship = 1,
@@ -20,6 +27,7 @@ const state = {
   speed: 0, // -0.5 .. 1
   showCurvature: true,
   reset: true,
+  loopToggle: false,
   fireCooldown: 0,
 };
 
@@ -78,6 +86,8 @@ window.addEventListener(
       cameraSelect.value = String(state.camera);
     } else if (e.code === "KeyR") {
       resetShip();
+    } else if (e.code === "KeyT") {
+      state.loopToggle = true;
     } else if (e.code === "KeyK") {
       state.showCurvature = !state.showCurvature;
     }
@@ -120,6 +130,22 @@ function readFire(dt: number): boolean {
 // ---------------------------------------------------------------------------
 // Rendering
 
+const loopStatus = document.querySelector<HTMLDivElement>("#loop-status")!;
+
+// Mirrors the LOOP_* modes in the shader.
+function showLoopStatus(mode: number, length: number) {
+  const len = length.toFixed(2);
+  const messages = [
+    "T: trace a loop",
+    "Tracing… press T to close the loop",
+    `Contracting… length ${len}`,
+    "Contracted to a point: the loop is trivial in π₁",
+    `Stuck at a closed geodesic of length ${len}: the loop is not contractible`,
+  ];
+  loopStatus.textContent = messages[mode] ?? "";
+  loopStatus.dataset.mode = String(mode);
+}
+
 function showError(msg: string) {
   const el = document.querySelector<HTMLDivElement>("#error")!;
   el.textContent = msg;
@@ -149,8 +175,8 @@ async function main() {
     console[m.type === "error" ? "error" : "warn"](`WGSL ${m.lineNum}:${m.linePos} ${m.message}`);
   }
 
-  // Layout matches `Uniforms` in the shader (48 bytes).
-  const uniformData = new ArrayBuffer(48);
+  // Layout matches `Uniforms` in the shader (64 bytes).
+  const uniformData = new ArrayBuffer(64);
   const f32 = new Float32Array(uniformData);
   const u32 = new Uint32Array(uniformData);
   const uniformBuffer = device.createBuffer({
@@ -162,22 +188,40 @@ async function main() {
   // read when drawing. 48 bytes of header plus 32 balls of 48 bytes.
   const worldBuffer = device.createBuffer({ size: 48 + 32 * 48, usage: GPUBufferUsage.STORAGE });
 
+  // The loop, plus a small buffer to read its header back for the status line.
+  const loopBuffer = device.createBuffer({
+    size: LOOP_BUFFER_SIZE,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  });
+  const loopReadback = device.createBuffer({
+    size: LOOP_HEADER_SIZE,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
+  let readbackPending = false;
+
   const computeLayout = device.createBindGroupLayout({
     entries: [
       { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
       { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
     ],
   });
   const renderLayout = device.createBindGroupLayout({
     entries: [
       { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
       { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
+      { binding: 4, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
     ],
   });
 
-  const computePipeline = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [computeLayout] }),
+  const computePipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [computeLayout] });
+  const updatePipeline = device.createComputePipeline({
+    layout: computePipelineLayout,
     compute: { module, entryPoint: "update" },
+  });
+  const contractPipeline = device.createComputePipeline({
+    layout: computePipelineLayout,
+    compute: { module, entryPoint: "contractLoop" },
   });
   const renderPipeline = device.createRenderPipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [renderLayout] }),
@@ -191,6 +235,7 @@ async function main() {
     entries: [
       { binding: 0, resource: { buffer: uniformBuffer } },
       { binding: 1, resource: { buffer: worldBuffer } },
+      { binding: 3, resource: { buffer: loopBuffer } },
     ],
   });
   const renderBindGroup = device.createBindGroup({
@@ -198,6 +243,7 @@ async function main() {
     entries: [
       { binding: 0, resource: { buffer: uniformBuffer } },
       { binding: 2, resource: { buffer: worldBuffer } },
+      { binding: 4, resource: { buffer: loopBuffer } },
     ],
   });
 
@@ -231,14 +277,18 @@ async function main() {
     u32[9] = state.reset ? 1 : 0;
     u32[10] = state.showCurvature ? 1 : 0;
     u32[11] = fire ? 1 : 0;
+    u32[12] = state.loopToggle ? 1 : 0;
     device.queue.writeBuffer(uniformBuffer, 0, uniformData);
     state.reset = false;
+    state.loopToggle = false;
 
     const encoder = device.createCommandEncoder();
 
     const compute = encoder.beginComputePass();
-    compute.setPipeline(computePipeline);
     compute.setBindGroup(0, computeBindGroup);
+    compute.setPipeline(updatePipeline);
+    compute.dispatchWorkgroups(1);
+    compute.setPipeline(contractPipeline);
     compute.dispatchWorkgroups(1);
     compute.end();
 
@@ -257,7 +307,21 @@ async function main() {
     pass.draw(3);
     pass.end();
 
+    const readback = !readbackPending;
+    if (readback) {
+      encoder.copyBufferToBuffer(loopBuffer, 0, loopReadback, 0, LOOP_HEADER_SIZE);
+    }
     device.queue.submit([encoder.finish()]);
+
+    if (readback) {
+      readbackPending = true;
+      loopReadback.mapAsync(GPUMapMode.READ).then(() => {
+        const header = loopReadback.getMappedRange();
+        showLoopStatus(new Uint32Array(header)[0], new Float32Array(header)[4]);
+        loopReadback.unmap();
+        readbackPending = false;
+      });
+    }
     requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);

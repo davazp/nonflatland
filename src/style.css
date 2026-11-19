@@ -43,6 +43,24 @@ canvas {
   padding: 2px 4px;
 }
 
+#loop-status {
+  max-width: 300px;
+  font-size: 12px;
+  color: #c9cde3;
+}
+
+#loop-status[data-mode="2"] {
+  color: #ff8ad8;
+}
+
+#loop-status[data-mode="3"] {
+  color: #ff8ad8;
+}
+
+#loop-status[data-mode="4"] {
+  color: #6dff8c;
+}
+
 #hud .help {
   opacity: 0.6;
   font-size: 11px;

@@ -39,6 +39,10 @@ struct Uniforms {
   reset: u32,
   showCurvature: u32,
   fire: u32,           // 1 to launch a ball this frame
+  loopToggle: u32,     // 1 when T was pressed this frame
+  _pad0: f32,
+  _pad1: f32,
+  _pad2: f32,
 };
 
 struct Ship {
@@ -71,6 +75,46 @@ struct World {
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var<storage, read_write> worldRW: World;
 @group(0) @binding(2) var<storage, read> worldRO: World;
+
+// A loop traced by the ship, then contracted by curve shortening. Points
+// are stored reduced; `next` is the following point expressed in this
+// point's chart, so segments can be drawn and measured across seams.
+const LOOP_MAX = 256;
+const LOOP_BLOCK = 16;
+const LOOP_BLOCKS = LOOP_MAX / LOOP_BLOCK;
+
+const LOOP_IDLE = 0u;
+const LOOP_RECORDING = 1u;
+const LOOP_CONTRACTING = 2u;
+const LOOP_CONTRACTED = 3u;   // shrank to a point: trivial in π₁
+const LOOP_STUCK = 4u;        // converged to a closed geodesic
+
+struct LoopPoint {
+  x: vec2f,
+  next: vec2f,
+  sheet: f32,
+  _pad: f32,
+  _pad2: vec2f,
+};
+
+struct Loop {
+  mode: u32,
+  count: u32,
+  stable: u32,         // consecutive frames with almost no change in length
+  kicks: u32,          // sideways pushes tried since the loop stopped changing
+  length: f32,
+  age: f32,            // seconds in the current mode
+  _pad2: vec2f,
+  _pad3: vec4f,
+  // Chart bounding boxes (min.xy, max.xy) of the segments of each block of
+  // LOOP_BLOCK points, to cull them when drawing.
+  blocks: array<vec4f, LOOP_BLOCKS>,
+  points: array<LoopPoint, LOOP_MAX>,
+  scratch: array<LoopPoint, LOOP_MAX>,
+};
+
+@group(0) @binding(3) var<storage, read_write> loopRW: Loop;
+@group(0) @binding(4) var<storage, read> loopRO: Loop;
 
 const PI = 3.14159265;
 
@@ -381,7 +425,7 @@ fn liftCount() -> i32 {
 }
 
 fn lift(k: i32, q: vec2f, sheet: f32) -> vec3f {
-  if (k == 0) {
+  if (k == 0 && !isSquare()) {
     return vec3f(q, sheet);
   }
   switch u.space {
@@ -395,6 +439,10 @@ fn lift(k: i32, q: vec2f, sheet: f32) -> vec3f {
       return vec3f(mobius(BOLZA_A * bolzaDir(k - 1), q), sheet);
     }
     default: {
+      // The 3×3 block of copies around the domain; k = 4 is the identity.
+      if (u.space == PLANE) {
+        return vec3f(q, sheet);
+      }
       let L = params().L;
       let i = k % 3 - 1;
       let j = k / 3 - 1;
@@ -477,6 +525,7 @@ fn update() {
     launchBall();
   }
   updateBalls();
+  updateLoop();
 }
 
 fn updateShip() {
@@ -540,6 +589,286 @@ fn updateBalls() {
     g = geoStep(g, 0.5 * u.dt);
     g = geoStep(g, 0.5 * u.dt);
     worldRW.balls[i] = Ball(g.x, g.v, vec4f(metric(g.x), 0.0), g.sheet, b.age + u.dt, vec2f(0.0));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Loops and curve shortening
+//
+// The loop is contracted by gradient descent on its discrete energy
+// Σ |x_{i+1} - x_i|²_G. A contractible loop shrinks to a point. Otherwise
+// it converges to the shortest closed geodesic in its free homotopy class
+// (Birkhoff curve shortening) and stops: the loop is non-trivial in π₁.
+
+// y (canonical, on sheet ys) expressed in the chart of x: its nearest copy.
+fn relative(x: vec2f, xs: f32, y: vec2f, ys: f32) -> vec2f {
+  var best = y;
+  var bestD = 1e30;
+  for (var k = 0; k < liftCount(); k++) {
+    let l = lift(k, y, ys);
+    if (abs(l.z - xs) > 0.5) {
+      continue;
+    }
+    let d = dot(l.xy - x, l.xy - x);
+    if (d < bestD) {
+      bestD = d;
+      best = l.xy;
+    }
+  }
+  return best;
+}
+
+// Intrinsic length of a short chart segment.
+fn segLength(a: vec2f, b: vec2f) -> f32 {
+  let d = b - a;
+  return sqrt(max(dot(d, metricMat(0.5 * (a + b)) * d), 0.0));
+}
+
+fn segEnergy(a: vec2f, b: vec2f) -> f32 {
+  let d = b - a;
+  return dot(d, metricMat(0.5 * (a + b)) * d);
+}
+
+fn loopSpacing() -> f32 {
+  return 0.5 * params().shipSize;
+}
+
+fn loopPoint(x: vec2f, sheet: f32) -> LoopPoint {
+  return LoopPoint(x, x, sheet, 0.0, vec2f(0.0));
+}
+
+fn loopNeighbour(i: u32, offset: u32) -> LoopPoint {
+  return loopRW.points[(i + offset) % loopRW.count];
+}
+
+fn appendLoopPoint(x: vec2f, sheet: f32) {
+  if (loopRW.count < u32(LOOP_MAX)) {
+    loopRW.points[loopRW.count] = loopPoint(x, sheet);
+    loopRW.count += 1u;
+  }
+}
+
+// Recompute `next`, the total length and the block bounding boxes.
+fn finishLoop(closed: bool) {
+  let n = loopRW.count;
+  var length = 0.0;
+  var lo = vec2f(1e30);
+  var hi = vec2f(-1e30);
+  for (var i = 0u; i < n; i++) {
+    if (i % u32(LOOP_BLOCK) == 0u) {
+      lo = vec2f(1e30);
+      hi = vec2f(-1e30);
+    }
+    let p = loopRW.points[i];
+    var next = p.next;
+    if (closed || i + 1u < n) {
+      let q = loopNeighbour(i, 1u);
+      next = relative(p.x, p.sheet, q.x, q.sheet);
+    }
+    loopRW.points[i].next = next;
+    length += segLength(p.x, next);
+    lo = min(lo, min(p.x, next));
+    hi = max(hi, max(p.x, next));
+    loopRW.blocks[i / u32(LOOP_BLOCK)] = vec4f(lo, hi);
+  }
+  loopRW.length = length;
+}
+
+// Join the end of the trace to the nearest copy of its start with a chart
+// segment. The shortening flow straightens it afterwards; the copy chosen
+// decides the homotopy class.
+fn closeLoop() {
+  let n = loopRW.count;
+  let last = loopRW.points[n - 1u];
+  let first = loopRW.points[0];
+  let start = relative(last.x, last.sheet, first.x, first.sheet);
+  let m = max(1, i32(ceil(segLength(last.x, start) / loopSpacing())));
+  for (var j = 1; j < m; j++) {
+    let c = reduce(mix(last.x, start, f32(j) / f32(m)), last.sheet);
+    appendLoopPoint(c.x, c.sheet);
+  }
+}
+
+fn hash(p: vec2f) -> f32 {
+  return fract(sin(dot(p, vec2f(12.9898, 78.233))) * 43758.5453);
+}
+
+// Point i after one step of Riemannian gradient descent on the energy.
+fn shortenPoint(i: u32, n: u32) -> LoopPoint {
+  let h = 1e-3 * params().L;
+  let p = loopRW.points[i];
+  let pa = loopNeighbour(i, n - 1u);
+  let pb = loopNeighbour(i, 1u);
+  let a = relative(p.x, p.sheet, pa.x, pa.sheet);
+  let b = relative(p.x, p.sheet, pb.x, pb.sheet);
+  let ex = vec2f(h, 0.0);
+  let ey = vec2f(0.0, h);
+  let grad = vec2f(
+    segEnergy(a, p.x + ex) + segEnergy(p.x + ex, b) - segEnergy(a, p.x - ex) - segEnergy(p.x - ex, b),
+    segEnergy(a, p.x + ey) + segEnergy(p.x + ey, b) - segEnergy(a, p.x - ey) - segEnergy(p.x - ey, b),
+  ) / (2.0 * h);
+  let g = metric(p.x);
+  let Ginv = mat2x2f(g.z, -g.y, -g.y, g.x) * (1.0 / (g.x * g.z - g.y * g.y));
+  // A step of 1/4 would jump to the midpoint in flat space; stay below.
+  var step = -0.2 * (Ginv * grad);
+  // A tiny sideways jitter so loops don't rest on unstable geodesics,
+  // such as a great circle of the sphere.
+  let side = vec2f(a.y - b.y, b.x - a.x);
+  let sideLen = sqrt(max(dot(side, metricMat(p.x) * side), 1e-12));
+  step += side / sideLen * (hash(vec2f(f32(i), u.time)) - 0.5) * 1e-3 * loopSpacing();
+  let c = reduce(p.x + step, p.sheet);
+  return loopPoint(c.x, c.sheet);
+}
+
+// Keep points roughly `spacing` apart: merge close ones (keeping at least
+// three) and split long segments.
+fn resampleLoop() {
+  let n = loopRW.count;
+  let spacing = loopSpacing();
+  var m = 0u;
+  for (var i = 0u; i < n; i++) {
+    let p = loopRW.points[i];
+    if (m > 0u && m + (n - i) > 3u) {
+      let last = loopRW.scratch[m - 1u];
+      let d = segLength(last.x, relative(last.x, last.sheet, p.x, p.sheet));
+      if (d < 0.5 * spacing) {
+        continue;
+      }
+    }
+    loopRW.scratch[m] = p;
+    m += 1u;
+    let q = loopNeighbour(i, 1u);
+    let qn = relative(p.x, p.sheet, q.x, q.sheet);
+    if (segLength(p.x, qn) > 1.6 * spacing && m + (n - i) < u32(LOOP_MAX)) {
+      let c = reduce(0.5 * (p.x + qn), p.sheet);
+      loopRW.scratch[m] = loopPoint(c.x, c.sheet);
+      m += 1u;
+    }
+  }
+  for (var i = 0u; i < m; i++) {
+    loopRW.points[i] = loopRW.scratch[i];
+  }
+  loopRW.count = m;
+}
+
+fn setLoopMode(mode: u32) {
+  loopRW.mode = mode;
+  loopRW.age = 0.0;
+  loopRW.stable = 0u;
+  loopRW.kicks = 0u;
+}
+
+// Push every point sideways by a quarter of the spacing. A loop resting on an
+// unstable closed geodesic (a great circle, the donut's outer equator)
+// gets shorter and keeps contracting; a true minimum comes back.
+fn kickLoop(side: f32) {
+  let n = loopRW.count;
+  for (var i = 0u; i < n; i++) {
+    let p = loopRW.points[i];
+    let pa = loopNeighbour(i, n - 1u);
+    let pb = loopNeighbour(i, 1u);
+    let t = relative(p.x, p.sheet, pb.x, pb.sheet) - relative(p.x, p.sheet, pa.x, pa.sheet);
+    let nrm = vec2f(-t.y, t.x);
+    let len = sqrt(max(dot(nrm, metricMat(p.x) * nrm), 1e-12));
+    let c = reduce(p.x + side * 0.25 * loopSpacing() * nrm / len, p.sheet);
+    loopRW.points[i] = loopPoint(c.x, c.sheet);
+  }
+}
+
+fn updateLoop() {
+  let ship = worldRW.ship;
+  if (u.reset != 0u) {
+    setLoopMode(LOOP_IDLE);
+    loopRW.count = 0u;
+  }
+  loopRW.age += u.dt;
+
+  if (u.loopToggle != 0u) {
+    if (loopRW.mode == LOOP_RECORDING && loopRW.count >= 2u) {
+      closeLoop();
+      setLoopMode(LOOP_CONTRACTING);
+    } else {
+      loopRW.count = 0u;
+      appendLoopPoint(ship.p, ship.sheet);
+      setLoopMode(LOOP_RECORDING);
+    }
+  }
+
+  switch loopRW.mode {
+    case LOOP_RECORDING: {
+      let n = loopRW.count;
+      let last = loopRW.points[n - 1u];
+      let s = relative(last.x, last.sheet, ship.p, ship.sheet);
+      if (segLength(last.x, s) >= loopSpacing()) {
+        appendLoopPoint(ship.p, ship.sheet);
+        if (loopRW.count == u32(LOOP_MAX)) {
+          closeLoop();
+          setLoopMode(LOOP_CONTRACTING);
+          finishLoop(true);
+          return;
+        }
+      }
+      // The open end follows the ship.
+      let end = loopRW.points[loopRW.count - 1u];
+      loopRW.points[loopRW.count - 1u].next = relative(end.x, end.sheet, ship.p, ship.sheet);
+      finishLoop(false);
+    }
+    default: {}
+  }
+}
+
+var<workgroup> wgMode: u32;
+var<workgroup> wgCount: u32;
+
+// Contract the loop: one invocation per point, Jacobi sweeps between
+// barriers, then serial resampling and bookkeeping by the first one.
+@compute @workgroup_size(LOOP_MAX)
+fn contractLoop(@builtin(local_invocation_index) i: u32) {
+  if (i == 0u) {
+    wgMode = loopRW.mode;
+    wgCount = loopRW.count;
+  }
+  let mode = workgroupUniformLoad(&wgMode);
+  let n = workgroupUniformLoad(&wgCount);
+  if (mode != LOOP_CONTRACTING) {
+    return;
+  }
+
+  for (var it = 0; it < 16; it++) {
+    var p: LoopPoint;
+    if (i < n) {
+      p = shortenPoint(i, n);
+    }
+    storageBarrier();
+    if (i < n) {
+      loopRW.points[i] = p;
+    }
+    storageBarrier();
+  }
+
+  if (i == 0u) {
+    let before = loopRW.length;
+    resampleLoop();
+    finishLoop(true);
+    let after = loopRW.length;
+    if (after < 0.3 * loopSpacing()) {
+      setLoopMode(LOOP_CONTRACTED);
+    } else if (abs(before - after) < 2e-5 * after) {
+      loopRW.stable += 1u;
+      if (loopRW.stable > 60u) {
+        if (loopRW.kicks < 2u) {
+          kickLoop(select(-1.0, 1.0, loopRW.kicks == 0u));
+          finishLoop(true);
+          loopRW.kicks += 1u;
+          loopRW.stable = 0u;
+        } else {
+          loopRW.mode = LOOP_STUCK;
+          loopRW.age = 0.0;
+        }
+      }
+    } else {
+      loopRW.stable = 0u;
+    }
   }
 }
 
@@ -858,6 +1187,46 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
       let core = mix(vec3f(1.0, 0.85, 0.4), vec3f(1.0, 1.0, 0.9), smoothstep(ballR, 0.0, d));
       col = mix(col, core, fill(d - ballR, bpw) * fade);
     }
+  }
+
+  // The loop: distance to its segments, over the copies of q.
+  let loopMode = loopRO.mode;
+  if (loopMode != LOOP_IDLE && loopRO.count > 0u) {
+    var dmin = 1e30;
+    let margin = vec2f(4.0 * pw);
+    let n = loopRO.count;
+    let blocks = (n + u32(LOOP_BLOCK) - 1u) / u32(LOOP_BLOCK);
+    for (var k = 0; k < liftCount(); k++) {
+      let l = lift(k, q, sheet);
+      for (var bl = 0u; bl < blocks; bl++) {
+        let box = loopRO.blocks[bl];
+        if (any(l.xy < box.xy - margin) || any(l.xy > box.zw + margin)) {
+          continue;
+        }
+        let end = min(n, (bl + 1u) * u32(LOOP_BLOCK));
+        for (var i = bl * u32(LOOP_BLOCK); i < end; i++) {
+          let p = loopRO.points[i];
+          if (abs(p.sheet - l.z) < 0.5) {
+            dmin = min(dmin, sdSegment(l.xy, p.x, p.next));
+          }
+        }
+      }
+    }
+    let dpx = dmin / pw;
+    var lc = vec3f(0.95);
+    var width = 0.9;
+    var alpha = 0.9;
+    if (loopMode == LOOP_CONTRACTING) {
+      lc = vec3f(1.0, 0.45, 0.85);
+    } else if (loopMode == LOOP_CONTRACTED) {
+      lc = vec3f(1.0, 0.45, 0.85);
+      alpha = 0.9 * (1.0 - smoothstep(0.0, 1.5, loopRO.age));
+    } else if (loopMode == LOOP_STUCK) {
+      lc = vec3f(0.4, 1.0, 0.55);
+      width = 1.6;
+      col += lc * 0.35 * exp(-dpx / 4.0);
+    }
+    col = mix(col, lc, alpha * fill(dpx - width, 0.75));
   }
 
   // Ship: approximate local coordinates by inverting the frame at the
