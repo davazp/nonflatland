@@ -6,6 +6,7 @@ import shaderCode from "./shader.wgsl?raw";
 
 const TURN_SPEED = 2.6; // rad/s
 const ACCEL = 2.8; // normalized speed units/s
+const FIRE_INTERVAL = 0.15; // s between balls while Space is held
 
 const enum Camera {
   Fixed = 0,
@@ -19,6 +20,7 @@ const state = {
   speed: 0, // -0.5 .. 1
   showCurvature: true,
   reset: true,
+  fireCooldown: 0,
 };
 
 // `zoom` scales the visible region: larger values show more of the space.
@@ -107,6 +109,14 @@ function readControls(dt: number): number {
   return ((left ? 1 : 0) - (right ? 1 : 0)) * TURN_SPEED * dt;
 }
 
+// Whether to launch a ball this frame: on press, then repeatedly while held.
+function readFire(dt: number): boolean {
+  state.fireCooldown = Math.max(0, state.fireCooldown - dt);
+  if (!keys.has("Space") || state.fireCooldown > 0) return false;
+  state.fireCooldown = FIRE_INTERVAL;
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // Rendering
 
@@ -148,8 +158,9 @@ async function main() {
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
-  // `Ship` in the shader: written by the compute pass, read when drawing.
-  const shipBuffer = device.createBuffer({ size: 32, usage: GPUBufferUsage.STORAGE });
+  // `World` in the shader (ship and balls): written by the compute pass,
+  // read when drawing. 48 bytes of header plus 32 balls of 48 bytes.
+  const worldBuffer = device.createBuffer({ size: 48 + 32 * 48, usage: GPUBufferUsage.STORAGE });
 
   const computeLayout = device.createBindGroupLayout({
     entries: [
@@ -166,7 +177,7 @@ async function main() {
 
   const computePipeline = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [computeLayout] }),
-    compute: { module, entryPoint: "updateShip" },
+    compute: { module, entryPoint: "update" },
   });
   const renderPipeline = device.createRenderPipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [renderLayout] }),
@@ -179,14 +190,14 @@ async function main() {
     layout: computeLayout,
     entries: [
       { binding: 0, resource: { buffer: uniformBuffer } },
-      { binding: 1, resource: { buffer: shipBuffer } },
+      { binding: 1, resource: { buffer: worldBuffer } },
     ],
   });
   const renderBindGroup = device.createBindGroup({
     layout: renderLayout,
     entries: [
       { binding: 0, resource: { buffer: uniformBuffer } },
-      { binding: 2, resource: { buffer: shipBuffer } },
+      { binding: 2, resource: { buffer: worldBuffer } },
     ],
   });
 
@@ -205,6 +216,7 @@ async function main() {
     const dt = Math.min(0.05, (now - last) / 1000);
     last = now;
     const turn = readControls(dt);
+    const fire = readFire(dt);
     resize();
 
     f32[0] = canvas.width;
@@ -218,6 +230,7 @@ async function main() {
     f32[8] = turn;
     u32[9] = state.reset ? 1 : 0;
     u32[10] = state.showCurvature ? 1 : 0;
+    u32[11] = fire ? 1 : 0;
     device.queue.writeBuffer(uniformBuffer, 0, uniformData);
     state.reset = false;
 

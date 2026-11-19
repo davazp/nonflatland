@@ -38,7 +38,7 @@ struct Uniforms {
   turn: f32,           // radians to turn this frame
   reset: u32,
   showCurvature: u32,
-  _pad: f32,
+  fire: u32,           // 1 to launch a ball this frame
 };
 
 struct Ship {
@@ -49,9 +49,28 @@ struct Ship {
   _pad: f32,
 };
 
+// A ball fired by the ship. It moves along a geodesic, like the ship.
+struct Ball {
+  p: vec2f,
+  v: vec2f,            // chart velocity
+  g: vec4f,            // metric at p (g11, g12, g22), cached for drawing
+  sheet: f32,
+  age: f32,            // seconds; dead once >= BALL_LIFE
+  _pad: vec2f,
+};
+
+const BALL_COUNT = 32;
+const BALL_LIFE = 4.0;
+
+struct World {
+  ship: Ship,
+  next: u32,           // ring buffer index of the next ball to launch
+  balls: array<Ball, BALL_COUNT>,
+};
+
 @group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var<storage, read_write> shipRW: Ship;
-@group(0) @binding(2) var<storage, read> shipRO: Ship;
+@group(0) @binding(1) var<storage, read_write> worldRW: World;
+@group(0) @binding(2) var<storage, read> worldRO: World;
 
 const PI = 3.14159265;
 
@@ -412,7 +431,7 @@ fn geoStep(g: Geo, h: f32) -> Geo {
 // Follow the geodesic from the ship with initial velocity `lp`, given in
 // the ship's orthonormal frame, for unit time.
 fn exponential(lp: vec2f) -> Geo {
-  let ship = shipRO;
+  let ship = worldRO.ship;
   var g = Geo(ship.p, ship.e1 * lp.x + ship.e2 * lp.y, ship.sheet);
   let n = clamp(i32(ceil(length(lp) / params().maxStep)), 1, 160);
   let h = 1.0 / f32(n);
@@ -446,11 +465,22 @@ fn gdot(G: mat2x2f, a: vec2f, b: vec2f) -> f32 {
 }
 
 @compute @workgroup_size(1)
-fn updateShip() {
-  var s = shipRW;
+fn update() {
   if (u.reset != 0u) {
-    s = Ship(vec2f(0.0, -0.3 * params().L), vec2f(1.0, 0.0), vec2f(0.0, 1.0), 0.0, 0.0);
+    worldRW.ship = Ship(vec2f(0.0, -0.3 * params().L), vec2f(1.0, 0.0), vec2f(0.0, 1.0), 0.0, 0.0);
+    for (var i = 0; i < BALL_COUNT; i++) {
+      worldRW.balls[i].age = BALL_LIFE;
+    }
   }
+  updateShip();
+  if (u.fire != 0u) {
+    launchBall();
+  }
+  updateBalls();
+}
+
+fn updateShip() {
+  let s = worldRW.ship;
 
   // Turn within the tangent plane.
   let c = cos(u.turn);
@@ -482,7 +512,35 @@ fn updateShip() {
   var e1 = f.e1 - gdot(G, f.e1, e2) * e2;
   e1 /= sqrt(gdot(G, e1, e1));
 
-  shipRW = Ship(f.x, e1, e2, sheet, 0.0);
+  worldRW.ship = Ship(f.x, e1, e2, sheet, 0.0);
+}
+
+// Launch a ball from the nose of the ship, straight ahead.
+fn launchBall() {
+  let P = params();
+  let s = worldRW.ship;
+  // Follow the geodesic from the centre of the ship to its nose. Geodesics
+  // keep their speed, so the velocity there still has length shipSize.
+  let nose = geoStep(Geo(s.p, s.e2 * P.shipSize, s.sheet), 1.0);
+  let speed = P.speed * (1.6 + max(u.speed, 0.0));
+  let v = nose.v / P.shipSize * speed;
+
+  let i = worldRW.next % u32(BALL_COUNT);
+  worldRW.balls[i] = Ball(nose.x, v, vec4f(metric(nose.x), 0.0), nose.sheet, 0.0, vec2f(0.0));
+  worldRW.next = (i + 1u) % u32(BALL_COUNT);
+}
+
+fn updateBalls() {
+  for (var i = 0; i < BALL_COUNT; i++) {
+    var b = worldRW.balls[i];
+    if (b.age >= BALL_LIFE) {
+      continue;
+    }
+    var g = Geo(b.p, b.v, b.sheet);
+    g = geoStep(g, 0.5 * u.dt);
+    g = geoStep(g, 0.5 * u.dt);
+    worldRW.balls[i] = Ball(g.x, g.v, vec4f(metric(g.x), 0.0), g.sheet, b.age + u.dt, vec2f(0.0));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -772,9 +830,39 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
     col = mix(col, tint, 0.3 * tanh(min(abs(K), 8.0)));
   }
 
+  // Balls: intrinsic distance √(Δᵀ G Δ), using the metric at the ball.
+  let ballR = 0.3 * P.shipSize;
+  for (var i = 0; i < BALL_COUNT; i++) {
+    let b = worldRO.balls[i];
+    if (b.age >= BALL_LIFE) {
+      continue;
+    }
+    let G = mat2x2f(b.g.x, b.g.y, b.g.y, b.g.z);
+    var bpw = P.shipView * u.zoom / halfRes;
+    if (u.camera == 0u) {
+      bpw = pw * pow(b.g.x * b.g.z - b.g.y * b.g.y, 0.25);
+    }
+    let fade = 1.0 - smoothstep(BALL_LIFE - 0.6, BALL_LIFE, b.age);
+    for (var k = 0; k < liftCount(); k++) {
+      let l = lift(k, q, sheet);
+      if (abs(l.z - b.sheet) > 0.5) {
+        continue;
+      }
+      let delta = l.xy - b.p;
+      let d = sqrt(max(dot(delta, G * delta), 0.0));
+      if (d > 3.0 * ballR) {
+        continue;
+      }
+      let glow = exp(-2.0 * max(d - ballR, 0.0) / ballR) * 0.5;
+      col += vec3f(1.0, 0.75, 0.3) * glow * fade;
+      let core = mix(vec3f(1.0, 0.85, 0.4), vec3f(1.0, 1.0, 0.9), smoothstep(ballR, 0.0, d));
+      col = mix(col, core, fill(d - ballR, bpw) * fade);
+    }
+  }
+
   // Ship: approximate local coordinates by inverting the frame at the
   // ship, which is accurate at the ship's scale.
-  let ship = shipRO;
+  let ship = worldRO.ship;
   let det = ship.e1.x * ship.e2.y - ship.e2.x * ship.e1.y;
   let Einv = mat2x2f(ship.e2.y, -ship.e1.y, -ship.e2.x, ship.e1.x) * (1.0 / det);
   var spw = P.shipView * u.zoom / halfRes / P.shipSize;
